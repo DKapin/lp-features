@@ -1,0 +1,38 @@
+{
+  "name": "openai-landing-page-analyzer",
+  "version": "2.0.0",
+  "description": "Advanced CRO landing page analysis using OpenAI GPT-4",
+  "main": "openai-analyzer.js",
+  "type": "module",
+  "scripts": {
+    "start": "node openai-analyzer.js",
+    "test": "node openai-analyzer.js test",
+    "analyze": "node openai-analyzer.js"
+  },
+  "keywords": [
+    "landing-page",
+    "cro",
+    "conversion-optimization",
+    "openai",
+    "gpt-4",
+    "ai-analysis",
+    "marketing"
+  ],
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cli-progress": "^3.12.0",
+    "csv-parser": "^3.0.0",
+    "csv-writer": "^1.6.0",
+    "dotenv": "^16.4.0",
+    "openai": "^6.9.1",
+    "p-limit": "^5.0.0",
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "winston": "^3.11.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,53 @@
+# Node.js dependencies
+node_modules/
+
+# Data files (CSV outputs)
+landing_page_features.csv
+full_landing_pages.csv
+sample_landing_pages.csv
+
+# Checkpoint files
+checkpoint_features.json
+
+# Log files
+*.log
+data_collection.log
+
+# Screenshots directory
+screenshots/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Test output
+test-results/
+coverage/
+
+# Documentation (exclude all markdown except README.md)
+*.md
+!README.md
