@@ -1,0 +1,259 @@
+# train_vcvr_model.py
+#
+# Goal:
+#   - Train a regression model to predict VCVR from landing-page features.
+#   - Handle missing data in a principled way.
+#   - Treat SEMrush domain RANK specially (missing data ≠ zero/average).
+#
+# Assumptions:
+#   - Your CSV has a column "VCVR" (target) and "URL" (ID).
+#   - SEMrush domain rank column is named "RANK".
+#   - File path may need to be changed to where your real data lives.
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+from xgboost import XGBRegressor
+import joblib
+
+
+# -------- CONFIG --------
+# Change this path to your real dataset location.
+DATA_PATH = Path("/mnt/data/landing_page_features.csv")
+
+TARGET_COL = "VCVR"
+ID_COLS = ["URL"]      # columns that are identifiers / not real features
+MODEL_PATH = Path("vcvr_xgb_model.joblib")
+
+
+def load_data(path: Path) -> pd.DataFrame:
+    """Load raw dataset from CSV."""
+    df = pd.read_csv(path)
+
+    if TARGET_COL not in df.columns:
+        raise ValueError(f"Target column '{TARGET_COL}' not found in dataset.")
+
+    print(f"Loaded raw dataset with shape: {df.shape}")
+    return df
+
+
+def clean_and_impute(df: pd.DataFrame):
+    """
+    Handle:
+      - dropping bad rows
+      - dropping unusable columns
+      - filling missing values (imputation)
+      - special logic for SEMrush domain rank ("RANK")
+
+    Returns:
+      X (features),
+      y (target),
+      imputation_info (dict with metadata about how we handled missingness)
+    """
+
+    df = df.copy()
+
+    # === 1. DROP ROWS WITH MISSING TARGET =========================
+    # If we don't know the VCVR for a row, we can't use it for supervised training.
+    before_rows = len(df)
+    df = df[df[TARGET_COL].notnull()]
+    after_rows = len(df)
+    print(f"Dropped {before_rows - after_rows} rows with missing {TARGET_COL}.")
+
+    # OPTIONAL: You may also want to drop rows with extremely low Clicks,
+    # because VCVR for those rows is very noisy. Example:
+    # min_clicks = 30
+    # if "Clicks" in df.columns:
+    #     before_rows = len(df)
+    #     df = df[df["Clicks"] >= min_clicks]
+    #     print(f"Dropped {before_rows - len(df)} rows with Clicks < {min_clicks}.")
+
+    # === 2. SPECIAL HANDLING FOR SEMRUSH DOMAIN RANK ===============
+    # We assume this column is named "RANK".
+    # Missing RANK does NOT mean 0 or average; it means "no SEMrush data".
+    # Strategy:
+    #   - Create a missing-indicator column: RANK_missing (0/1)
+    #   - Fill missing RANK values with a sentinel value (-1)
+    #   - Exclude RANK from generic imputation below (we've already handled it)
+    sentinel_cols = {}
+    if "RANK" in df.columns:
+        # Create a missing flag (model can learn if "no SEMrush data" matters)
+        df["RANK_missing"] = df["RANK"].isnull().astype(int)
+
+        # Sentinel value for missing ranks
+        sentinel_value = -1
+        df["RANK"] = df["RANK"].fillna(sentinel_value)
+        sentinel_cols["RANK"] = sentinel_value
+
+        print("Applied sentinel imputation to 'RANK' and created 'RANK_missing' flag.")
+        # Note: RANK is now fully populated and should NOT be further imputed later.
+
+    # === 3. DROP BAD COLUMNS (TOO MANY MISSING VALUES) =============
+    # Columns with a high percentage of missing values are often not very useful.
+    # You can tweak this threshold (0.4 = 40%).
+    missing_ratio = df.isnull().mean()
+
+    cols_to_drop = []
+    for c in df.columns:
+        # Don't drop target; don't drop RANK; don't drop RANK_missing
+        if c in [TARGET_COL, "RANK", "RANK_missing"]:
+            continue
+        if missing_ratio[c] > 0.40:
+            cols_to_drop.append(c)
+
+    if cols_to_drop:
+        print("Dropping columns with >40% missing values:")
+        for c in cols_to_drop:
+            print(f"  - {c} (missing {missing_ratio[c]:.1%})")
+
+    df = df.drop(columns=cols_to_drop)
+
+    # === 4. SEPARATE TARGET AND ID COLUMNS =========================
+    target = df[TARGET_COL].astype(float)
+    id_cols_present = [c for c in ID_COLS if c in df.columns]
+
+    # Remove ID columns + target from feature matrix
+    feature_df = df.drop(columns=id_cols_present + [TARGET_COL])
+
+    # === 5. WORK ONLY WITH NUMERIC FEATURES FOR NOW ================
+    # For v1, ignore non-numeric columns. Later you can add proper encoding if needed.
+    num_cols = feature_df.select_dtypes(include=[np.number]).columns.tolist()
+    feature_df = feature_df[num_cols]
+
+    # === 6. IMPUTE (FILL) MISSING NUMERIC VALUES ===================
+    # Strategy:
+    #   - For counts/ratios/percent-like features → fill with 0
+    #   - For other numeric features → fill with median
+    #   - We skip special columns like RANK (already handled)
+
+    imputation_info = {
+        "zero_cols": [],         # columns we filled with 0
+        "median_cols": {},       # columns we filled with their median
+        "dropped_cols": cols_to_drop,
+        "sentinel_cols": sentinel_cols,  # e.g. {"RANK": -1}
+    }
+
+    special_impute_cols = set(["RANK", "RANK_missing"])  # handled separately / no NAs
+
+    for col in num_cols:
+        if col in special_impute_cols:
+            # RANK is already imputed; RANK_missing is 0/1 with no NAs.
+            continue
+
+        col_missing = feature_df[col].isnull().mean()
+        if col_missing == 0:
+            # nothing to do
+            continue
+
+        # Heuristic: treat columns with names that look like counts/ratios/percents
+        # as "0 means none" when missing.
+        col_upper = col.upper()
+        if "COUNT" in col_upper or "RATIO" in col_upper or "PERCENT" in col_upper:
+            feature_df[col] = feature_df[col].fillna(0)
+            imputation_info["zero_cols"].append(col)
+            print(f"Filled missing values in '{col}' with 0 (count/ratio-like).")
+        else:
+            median_val = feature_df[col].median()
+            feature_df[col] = feature_df[col].fillna(median_val)
+            imputation_info["median_cols"][col] = float(median_val)
+            print(
+                f"Filled missing values in '{col}' with median={median_val:.4f}."
+            )
+
+    # Final safety check: no NaNs should remain in features
+    if feature_df.isnull().any().any():
+        n_bad = feature_df.isnull().any(axis=1).sum()
+        print(f"WARNING: {n_bad} rows still have NaNs after imputation.")
+
+    X = feature_df
+    y = target.loc[X.index]
+
+    print(f"Final feature matrix shape: {X.shape}")
+    print(f"Final target shape:        {y.shape}")
+
+    return X, y, imputation_info
+
+
+def train_model(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
+    """
+    Train an XGBoost regression model on the cleaned data.
+
+    Things to watch:
+      - If validation R² is very low or negative, your features or target
+        may be too noisy or misaligned.
+      - You may want to later use cross-validation grouped by vendor.
+    """
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    model = XGBRegressor(
+        n_estimators=1200,
+        learning_rate=0.03,
+        max_depth=8,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:squarederror",
+        n_jobs=-1,
+        tree_method="hist",  # good default for tabular data
+    )
+
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=50,
+        early_stopping_rounds=50,
+    )
+
+    # Evaluate basic performance
+    y_val_pred = model.predict(X_val)
+    mae = mean_absolute_error(y_val, y_val_pred)
+    r2 = r2_score(y_val, y_val_pred)
+
+    print("Validation MAE:", mae)
+    print("Validation R²:", r2)
+
+    return model
+
+
+def save_model(model: XGBRegressor, feature_columns, imputation_info, path: Path):
+    """
+    Save:
+      - model
+      - feature_columns (order matters for inference)
+      - imputation_info (so inference can mimic training-time imputation)
+    """
+    payload = {
+        "model": model,
+        "feature_columns": list(feature_columns),
+        "imputation_info": imputation_info,
+    }
+    joblib.dump(payload, path)
+    print(f"Saved model + metadata to {path}")
+
+
+def main():
+    # 1. Load raw data
+    df = load_data(DATA_PATH)
+
+    # 2. Clean + handle missing values
+    #    This is where:
+    #      - rows with missing VCVR are dropped
+    #      - columns with >40% missing are dropped
+    #      - RANK gets special handling (sentinel + missing flag)
+    #      - other numeric columns get 0/median imputation
+    X, y, imputation_info = clean_and_impute(df)
+
+    # 3. Train model
+    model = train_model(X, y)
+
+    # 4. Persist model + feature list + imputation metadata
+    save_model(model, X.columns, imputation_info, MODEL_PATH)
+
+
+if __name__ == "__main__":
+    main()
