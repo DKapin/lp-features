@@ -257,3 +257,116 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+# predict_vcvr.py
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import joblib
+
+MODEL_PATH = Path("vcvr_xgb_model.joblib")
+
+
+def load_trained_model():
+    """
+    Load the trained model and metadata:
+      - model
+      - feature_columns: list of columns in the order expected by the model
+      - imputation_info: how we filled missing values during training
+    """
+    payload = joblib.load(MODEL_PATH)
+    model = payload["model"]
+    feature_columns = payload["feature_columns"]
+    imputation_info = payload.get("imputation_info", None)
+    return model, feature_columns, imputation_info
+
+
+def apply_basic_imputation_for_inference(df: pd.DataFrame, imputation_info) -> pd.DataFrame:
+    """
+    At inference we ideally have clean features already (your LP feature extractor
+    should mirror the training engineering), but this function:
+      - applies the same "fill with 0" for zero_cols
+      - applies the same medians for median_cols
+      - ensures no NaNs are left
+
+    This helps when the extractor is imperfect or when some fields are occasionally missing.
+    """
+
+    df = df.copy()
+
+    if imputation_info is None:
+        # Fallback: just fill any remaining NaNs with 0
+        # (you may want to be more strict and log/warn here)
+        return df.fillna(0)
+
+    # Fill training-time zero_cols with 0
+    for col in imputation_info.get("zero_cols", []):
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # Fill training-time median_cols with same median values
+    for col, median_val in imputation_info.get("median_cols", {}).items():
+        if col in df.columns:
+            df[col] = df[col].fillna(median_val)
+
+    # Any remaining NaNs after the above → default to 0
+    df = df.fillna(0)
+
+    return df
+
+
+def predict_vcvr_from_features(features: pd.DataFrame) -> np.ndarray:
+    """
+    features: DataFrame with (ideally) the same columns used during training.
+              Extra columns are ignored. Missing columns are added as 0.
+
+    Returns:
+      np.ndarray of predicted VCVR values.
+    """
+    model, feature_columns, imputation_info = load_trained_model()
+
+    # Work only with numeric features for safety
+    features_num = features.select_dtypes(include=[np.number]).copy()
+
+    # Apply similar imputation logic as during training
+    features_num = apply_basic_imputation_for_inference(features_num, imputation_info)
+
+    # Reindex to match training feature order.
+    # Any missing columns will be created and filled with 0.
+    X = features_num.reindex(columns=feature_columns, fill_value=0.0)
+
+    # Optional sanity check/logging
+    missing_cols = [c for c in feature_columns if c not in features_num.columns]
+    if missing_cols:
+        print(f"WARNING: {len(missing_cols)} expected feature columns were missing at inference.")
+        # In a production system you might log these somewhere.
+
+    preds = model.predict(X)
+    return preds
+
+
+# Example usage with your existing CSV row (to smoke test prediction)
+if __name__ == "__main__":
+    df = pd.read_csv("/mnt/data/landing_page_features.csv")
+
+    # Drop obvious non-feature columns if present
+    for col in ["URL", "VCVR"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    preds = predict_vcvr_from_features(df)
+
+    # If you still have the URLs somewhere, you can map them;
+    # here we just print index + prediction.
+    for i, pred in enumerate(preds):
+        print(f"Row {i} → predicted VCVR: {pred:.4f}")
