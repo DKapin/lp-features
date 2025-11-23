@@ -198,21 +198,42 @@ def clean_and_impute(df: pd.DataFrame):
     print(f"Final feature matrix shape: {X.shape}")
     print(f"Final target shape:        {y.shape}")
 
-    return X, y, imputation_info
+    # --- Build sample weights from Clicks (optional but recommended) ---
+    # Default: no weights
+    sample_weight = None
+
+    if "Clicks" in df.columns:
+        # Align with X/y indices
+        clicks = df.loc[X.index, "Clicks"].astype(float)
+
+        # Example scheme: sqrt of clicks, capped at 1000
+        # You can tweak this:
+        #   - clicks.clip(upper=1000)
+        #   - or just clicks
+        sample_weight = np.sqrt(clicks.clip(lower=1, upper=1000))
+
+        print("Sample weights created from Clicks (using sqrt(capped clicks)).")
+
+    return X, y, imputation_info, sample_weight
 
 
-def train_model(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
-    """
-    Train an XGBoost regression model on the cleaned data.
+from sklearn.model_selection import train_test_split
 
-    Things to watch:
-      - If validation R² is very low or negative, your features or target
-        may be too noisy or misaligned.
-      - You may want to later use cross-validation grouped by vendor.
-    """
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+def train_model(X, y, sample_weight: np.ndarray | None = None) -> XGBRegressor:
+    if sample_weight is not None:
+        X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
+            X, y, sample_weight,
+            test_size=0.2,
+            random_state=42
+        )
+    else:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y,
+            test_size=0.2,
+            random_state=42
+        )
+        w_train = None
+        w_val = None
 
     model = XGBRegressor(
         n_estimators=1200,
@@ -222,18 +243,18 @@ def train_model(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
         colsample_bytree=0.8,
         objective="reg:squarederror",
         n_jobs=-1,
-        tree_method="hist",  # good default for tabular data
+        tree_method="hist",
+        early_stopping_rounds=50,
     )
 
     model.fit(
         X_train,
         y_train,
+        sample_weight=w_train,   # <-- here’s where weights go
         eval_set=[(X_val, y_val)],
         verbose=50,
-        early_stopping_rounds=50,
     )
 
-    # Evaluate basic performance
     y_val_pred = model.predict(X_val)
     mae = mean_absolute_error(y_val, y_val_pred)
     r2 = r2_score(y_val, y_val_pred)
@@ -242,6 +263,7 @@ def train_model(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
     print("Validation R²:", r2)
 
     return model
+
 
 
 def save_model(model: XGBRegressor, feature_columns, imputation_info, path: Path):
@@ -270,12 +292,10 @@ def main():
     #      - columns with >40% missing are dropped
     #      - RANK gets special handling (sentinel + missing flag)
     #      - other numeric columns get 0/median imputation
-    X, y, imputation_info = clean_and_impute(df)
+    X, y, imputation_info, sample_weight = clean_and_impute(df)
 
-    # 3. Train model
-    model = train_model(X, y)
+    model = train_model(X, y, sample_weight=sample_weight)
 
-    # 4. Persist model + feature list + imputation metadata
     save_model(model, X.columns, imputation_info, MODEL_PATH)
 
 
