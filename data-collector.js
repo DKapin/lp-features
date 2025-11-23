@@ -1114,6 +1114,26 @@ class LandingPageDataCollector {
         // Extract features
         const features = await this.extractObjectiveFeatures(url);
 
+        // --- Identify internal pages (Capterra/GDM built) ---
+        let isInternal = 0;
+        
+        try {
+          const hostname = new URL(url).hostname.toLowerCase();
+          if (
+            hostname === "landing.capterra.com" ||
+            hostname === "info.gartnerdigitalmarkets.com"
+          ) {
+            isInternal = 1;
+          }
+        } catch (e) {
+          // fallback if URL parsing fails
+          isInternal = 0;
+        }
+        
+        // attach flag to your feature row
+        features.IsInternal = isInternal;
+
+
         // Add target variables if provided
         if (conversionRate !== null) {
           features.conversion_rate = conversionRate;
