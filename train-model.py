@@ -91,6 +91,30 @@ def clean_and_impute(df: pd.DataFrame):
         print("Applied sentinel imputation to 'RANK' and created 'RANK_missing' flag.")
         # Note: RANK is now fully populated and should NOT be further imputed later.
 
+
+        # === CATEGORY-LEVEL STATS ==============================
+        # We create numeric features summarizing how this category performs overall.
+        # NOTE: This uses the full dataset, which is fine for a first version.
+        # For very strict leakage control, you could recompute these inside
+        # the train/validation split later.
+        if "Category" in df.columns:
+            cat_stats = (
+                df.groupby("Category")[TARGET_COL]
+                  .agg(
+                      cat_mean_vcvr="mean",
+                      cat_median_vcvr="median",
+                      cat_count="count",
+                  )
+                  .reset_index()
+            )
+
+        # Merge back so each row has its category's stats
+        df = df.merge(cat_stats, on="Category", how="left")
+        print(
+            "Added category-level stats: cat_mean_vcvr, "
+            "cat_median_vcvr, cat_count"
+        )
+
     # === 3. DROP BAD COLUMNS (TOO MANY MISSING VALUES) =============
     # Columns with a high percentage of missing values are often not very useful.
     # You can tweak this threshold (0.4 = 40%).
