@@ -1114,14 +1114,14 @@ class LandingPageDataCollector {
         // Extract features
         const features = await this.extractObjectiveFeatures(url);
 
-        // --- Identify internal pages (Capterra/GDM built) ---
+        // --- Identify internal pages ---
         let isInternal = 0;
         
         try {
           const hostname = new URL(url).hostname.toLowerCase();
           if (
-            hostname === "landing.capterra.com" ||
-            hostname === "info.gartnerdigitalmarkets.com"
+            hostname === "landing.example.com" ||
+            hostname === "info.example.com"
           ) {
             isInternal = 1;
           }
