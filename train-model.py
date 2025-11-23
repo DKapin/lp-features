@@ -28,6 +28,9 @@ TARGET_COL = "VCVR"
 ID_COLS = ["URL"]      # columns that are identifiers / not real features
 MODEL_PATH = Path("vcvr_xgb_model.joblib")
 
+INTERNAL_FLAG_COL = "IsInternal"   # change if your column has a different name
+
+
 
 def load_data(path: Path) -> pd.DataFrame:
     """Load raw dataset from CSV."""
@@ -200,19 +203,40 @@ def clean_and_impute(df: pd.DataFrame):
 
     # --- Build sample weights from Clicks (optional but recommended) ---
     # Default: no weights
+# === 8. BUILD SAMPLE WEIGHTS: CLICKS + INTERNAL FLAG ===========
     sample_weight = None
 
+    # Base weight from Clicks (if present)
     if "Clicks" in df.columns:
-        # Align with X/y indices
         clicks = df.loc[X.index, "Clicks"].astype(float)
+        # Guard against zero / negative
+        clicks = clicks.clip(lower=1)
 
-        # Example scheme: sqrt of clicks, capped at 1000
-        # You can tweak this:
-        #   - clicks.clip(upper=1000)
-        #   - or just clicks
-        sample_weight = np.sqrt(clicks.clip(lower=1, upper=1000))
+        # sqrt of capped clicks: softer than linear, prevents whales dominating
+        base_weight = np.sqrt(clicks.clip(upper=1000))
+    else:
+        base_weight = np.ones(len(X))
+        print("Clicks column not found; using uniform base weights.")
 
-        print("Sample weights created from Clicks (using sqrt(capped clicks)).")
+    # Internal vs external multiplier
+    if INTERNAL_FLAG_COL in df.columns:
+        internal_flag = df.loc[X.index, INTERNAL_FLAG_COL].fillna(0)
+        # Expecting 0/1; if it's True/False, this still works
+        internal_flag = (internal_flag != 0).astype(int)
+
+        internal_multiplier = np.where(internal_flag == 1, 2.0, 1.0)
+        sample_weight = base_weight * internal_multiplier
+
+        print(
+            f"Applied internal page weight multiplier (x2) "
+            f"using '{INTERNAL_FLAG_COL}' flag."
+        )
+    else:
+        sample_weight = base_weight
+        print(
+            f"Internal flag column '{INTERNAL_FLAG_COL}' not found; "
+            f"no internal vs external weighting applied."
+        )
 
     return X, y, imputation_info, sample_weight
 
