@@ -94,7 +94,7 @@ class LandingPageDataCollector {
 
     // Launch with stealth settings to appear more human-like
     this.browser = await puppeteer.launch({
-      headless: 'new',
+      headless: 'new',  // Use new headless mode for better performance
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -501,25 +501,51 @@ class LandingPageDataCollector {
       // Get primary CTA using intelligent detection
       const primaryCTA = this.getPrimaryCTA($, heroSection);
 
-      // Improved CTA detection
-      const allCTAs = $('button:not([type="submit"]):not([aria-label*="close"]):not([aria-label*="menu"]), ' +
-                       'a.btn, a.button, a[class*="cta"], a[class*="button-"], ' +
-                       '[role="button"]:not([aria-label*="close"]):not([aria-label*="menu"])');
+      // Improved CTA detection - comprehensive selector
+      const allCTAs = $('button, ' +
+                       'a.btn, a.button, a[class*="cta"], a[class*="button"], ' +
+                       '[role="button"], input[type="submit"]');
 
       // Filter out likely non-CTAs
       const ctaElements = allCTAs.filter((_i, el) => {
         const text = $(el).text().trim().toLowerCase();
-        const excludeWords = ['close', 'menu', 'toggle', 'dismiss', 'cancel', 'back', 'previous', 'next slide'];
-        return !excludeWords.some(word => text.includes(word)) && text.length > 0 && text.length < 100;
+        const ariaLabel = ($(el).attr('aria-label') || '').toLowerCase();
+        const excludeWords = [
+          'close', 'menu', 'toggle', 'dismiss', 'cancel', 'back', 'previous', 'next slide', 'search',
+          'log in', 'login', 'log-in', 'sign in', 'signin', 'sign-in',
+          'accept', 'reject', 'decline', 'deny', 'manage cookies', 'cookie settings', 'privacy settings',
+          'play', 'pause', 'mute', 'unmute', 'skip', 'stop',
+          'expand', 'collapse', 'show more', 'show less', 'read more', 'read less'
+        ];
+
+        // Exclude navigation/utility buttons by text or aria-label
+        const isExcluded = excludeWords.some(word => text.includes(word) || ariaLabel.includes(word));
+
+        return !isExcluded && text.length > 0 && text.length < 100;
       });
+
+      // Detect potential bot blocking
+      // Criteria 1: Completely blank page (0 buttons/inputs + minimal content <50 words)
+      // Criteria 2: Page loaded but no interactive elements (0 buttons/inputs but has content)
+      //   - This catches cases like BambooHR where text loads but forms are blocked
+      const buttonCount = await page.evaluate(() => document.querySelectorAll('button').length);
+      const inputCount = await page.evaluate(() => document.querySelectorAll('input').length);
+      const wordCount = bodyText.split(/\s+/).filter(w => w.length > 0).length;
+
+      const completelyBlocked = (buttonCount === 0 && inputCount === 0 && wordCount < 50);
+      const partiallyBlocked = (buttonCount === 0 && inputCount === 0 && wordCount >= 50 && wordCount < 2000);
+      const botDetectionSuspected = (completelyBlocked || partiallyBlocked) ? 1 : 0;
 
       // OBJECTIVE FEATURE EXTRACTION
       const features = {
         // === IDENTIFIERS ===
         url: url,
 
+        // === DATA QUALITY FLAGS ===
+        bot_detection_suspected: botDetectionSuspected,
+
         // === CONTENT METRICS ===
-        total_word_count: bodyText.split(/\s+/).filter(w => w.length > 0).length,
+        total_word_count: wordCount,
         main_content_word_count: mainContent.split(/\s+/).filter(w => w.length > 0).length,
         reading_level: this.calculateReadingLevel(mainContent),
 
@@ -536,6 +562,74 @@ class LandingPageDataCollector {
         form_count: $('form').length,
         form_field_count: $('form input[type!="hidden"], form textarea, form select').length,
         has_email_capture: $('input[type="email"], input[name*="email"], input[placeholder*="email" i]').length > 0 ? 1 : 0,
+
+        // === MODAL FORM DETECTION ===
+        has_modal_form: await page.evaluate(() => {
+          // Strategy 1: Hidden forms (display:none, visibility:hidden, or not visible)
+          const allForms = Array.from(document.querySelectorAll('form'));
+          const hasHiddenForm = allForms.some(form => {
+            const style = window.getComputedStyle(form);
+            return form.offsetParent === null ||
+                   style.display === 'none' ||
+                   style.visibility === 'hidden' ||
+                   parseFloat(style.opacity) === 0;
+          });
+
+          // Strategy 2: Forms inside modal/dialog containers
+          const modalSelectors = [
+            '[role="dialog"] form',
+            '[aria-modal="true"] form',
+            '.modal form',
+            '.dialog form',
+            '[class*="modal"] form',
+            '[class*="popup"] form',
+            '[class*="overlay"] form',
+            '[id*="modal"] form',
+            '[data-modal] form'
+          ];
+          const hasModalContainer = modalSelectors.some(selector =>
+            document.querySelectorAll(selector).length > 0
+          );
+
+          // Strategy 3: Buttons that trigger modals with form-related text
+          const modalTriggers = document.querySelectorAll(`
+            [data-modal],
+            [data-toggle="modal"],
+            [data-bs-toggle="modal"],
+            button[onclick*="modal"],
+            button[onclick*="popup"],
+            a[href*="#modal"],
+            a[href*="#signup"],
+            a[href*="#contact"]
+          `);
+          const hasTriggerWithFormKeyword = Array.from(modalTriggers).some(btn => {
+            const text = btn.textContent.toLowerCase();
+            return /sign up|contact|get started|request demo|subscribe|join|register/i.test(text);
+          });
+
+          return (hasHiddenForm || hasModalContainer || hasTriggerWithFormKeyword) ? 1 : 0;
+        }),
+
+        modal_form_trigger_count: await page.evaluate(() => {
+          // Count buttons/links that likely trigger modal forms
+          const triggers = document.querySelectorAll(`
+            [data-modal],
+            [data-toggle="modal"],
+            [data-bs-toggle="modal"],
+            button[onclick*="modal"],
+            button[onclick*="popup"],
+            a[href*="#modal"],
+            a[href*="#signup"],
+            a[href*="#contact"],
+            a[href*="#demo"]
+          `);
+
+          return Array.from(triggers).filter(trigger => {
+            const text = trigger.textContent.toLowerCase();
+            // Only count if it has form-related keywords
+            return /sign up|contact|get started|request demo|subscribe|join|register|schedule|book|form/i.test(text);
+          }).length;
+        }),
 
         // === VISUAL ELEMENTS (IMPROVED) ===
         total_image_count: $('img').length,
@@ -750,11 +844,28 @@ class LandingPageDataCollector {
 
         // === CRO TIER 1: ABOVE-THE-FOLD OPTIMIZATION ===
         above_fold_cta_count: await page.evaluate((vh) => {
-          return Array.from(document.querySelectorAll('button, a.btn, a.button, [role="button"], .cta, [class*="cta-"]'))
-            .filter(el => {
-              const rect = el.getBoundingClientRect();
-              return rect.top >= 0 && rect.top < vh;
-            }).length;
+          const ctaSelector = 'button, a.btn, a.button, a[class*="cta"], a[class*="button"], [role="button"], input[type="submit"]';
+          const elements = Array.from(document.querySelectorAll(ctaSelector));
+
+          const excludeWords = [
+            'close', 'menu', 'toggle', 'dismiss', 'cancel', 'back', 'previous', 'next slide', 'search',
+            'log in', 'login', 'log-in', 'sign in', 'signin', 'sign-in',
+            'accept', 'reject', 'decline', 'deny', 'manage cookies', 'cookie settings', 'privacy settings',
+            'play', 'pause', 'mute', 'unmute', 'skip', 'stop',
+            'expand', 'collapse', 'show more', 'show less', 'read more', 'read less'
+          ];
+
+          return elements.filter(el => {
+            const rect = el.getBoundingClientRect();
+            const text = el.textContent.trim().toLowerCase();
+            const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+
+            const isAboveFold = rect.top >= 0 && rect.top < vh;
+            const isExcluded = excludeWords.some(word => text.includes(word) || ariaLabel.includes(word));
+            const passesTextLength = text.length > 0 && text.length < 100;
+
+            return isAboveFold && !isExcluded && passesTextLength;
+          }).length;
         }, viewportHeight),
 
         above_fold_headline_visible: await page.evaluate((vh) => {
@@ -772,12 +883,35 @@ class LandingPageDataCollector {
             }).length;
         }, viewportHeight),
 
+        above_fold_form_present: await page.evaluate((vh) => {
+          const forms = Array.from(document.querySelectorAll('form'));
+          const hasAboveFoldForm = forms.some(form => {
+            const rect = form.getBoundingClientRect();
+            return rect.top >= 0 && rect.top < vh;
+          });
+          return hasAboveFoldForm ? 1 : 0;
+        }, viewportHeight),
+
+        above_fold_form_field_count: await page.evaluate((vh) => {
+          const forms = Array.from(document.querySelectorAll('form'));
+          const aboveFoldForms = forms.filter(form => {
+            const rect = form.getBoundingClientRect();
+            return rect.top >= 0 && rect.top < vh;
+          });
+
+          let totalFields = 0;
+          aboveFoldForms.forEach(form => {
+            const fields = form.querySelectorAll('input, select, textarea');
+            totalFields += fields.length;
+          });
+
+          return totalFields;
+        }, viewportHeight),
+
         hero_cta_text_length: heroSection.find('button, a.btn, a.button, [role="button"]').first().text().trim().length,
 
         // === CRO TIER 1: VALUE PROPOSITION CLARITY ===
-        headline_contains_benefit: !!(
-          $('h1').text().match(/save|get|free|instant|easy|fast|guaranteed|proven|better|best|more/i)
-        ) ? 1 : 0,
+        headline_contains_benefit: $('h1').text().match(/save|get|free|instant|easy|fast|guaranteed|proven|better|best|more/i) ? 1 : 0,
 
         headline_contains_number: /\d+/.test($('h1').text()) ? 1 : 0,
 
@@ -791,22 +925,18 @@ class LandingPageDataCollector {
         primary_cta_in_hero: primaryCTA.score >= 30 ? 1 : 0,
         primary_cta_is_button_element: primaryCTA.tag === 'button' ? 1 : 0,
 
-        cta_uses_action_verb: !!(
-          primaryCTA.text.toLowerCase().match(/^(get|start|try|download|claim|join|discover|learn|see|find|build|create|grow|sign|subscribe|buy|purchase)/)
-        ) ? 1 : 0,
+        cta_uses_action_verb: primaryCTA.text.toLowerCase().match(/^(get|start|try|download|claim|join|discover|learn|see|find|build|create|grow|sign|subscribe|buy|purchase)/) ? 1 : 0,
 
-        cta_uses_first_person: !!(
-          primaryCTA.text.match(/\b(my|I'm|I'll|me)\b/i)
-        ) ? 1 : 0,
+        cta_uses_first_person: primaryCTA.text.match(/\b(my|I'm|I'll|me)\b/i) ? 1 : 0,
 
         // === CRO TIER 1: URGENCY & SCARCITY (Enhanced) ===
-        specific_deadline_present: !!(bodyText.match(/\d+\s*(hours?|days?|minutes?)\s*(left|remaining)/i)) ? 1 : 0,
+        specific_deadline_present: bodyText.match(/\d+\s*(hours?|days?|minutes?)\s*(left|remaining)/i) ? 1 : 0,
 
-        stock_scarcity_present: !!(bodyText.match(/only\s+\d+\s+(left|remaining|in stock)/i)) ? 1 : 0,
+        stock_scarcity_present: bodyText.match(/only\s+\d+\s+(left|remaining|in stock)/i) ? 1 : 0,
 
-        limited_spots_present: !!(bodyText.match(/\d+\s*(spots?|seats?)\s*(left|remaining|available)/i)) ? 1 : 0,
+        limited_spots_present: bodyText.match(/\d+\s*(spots?|seats?)\s*(left|remaining|available)/i) ? 1 : 0,
 
-        expiring_offer_present: !!(bodyText.match(/expires?|ending|last chance|don't miss/i)) ? 1 : 0,
+        expiring_offer_present: bodyText.match(/expires?|ending|last chance|don't miss/i) ? 1 : 0,
 
         // === CRO TIER 1: SOCIAL PROOF SPECIFICITY ===
         testimonial_has_photo: (() => {
@@ -864,10 +994,10 @@ class LandingPageDataCollector {
         review_platform_badges: (() => {
           // Detect specific review platform badges (G2, Capterra, Software Advice, GetApp)
           const badges = {
-            g2: false,
-            capterra: false,
-            software_advice: false,
-            getapp: false
+            g2: 0,
+            capterra: 0,
+            software_advice: 0,
+            getapp: 0
           };
 
           // Strategy 1: Image alt text
@@ -877,10 +1007,10 @@ class LandingPageDataCollector {
             const src = $(img).attr('src') || '';
             const combined = (alt + ' ' + src).toLowerCase();
 
-            if (combined.match(/\bg2\b|g2\.com|g2crowd/i)) badges.g2 = true;
-            if (combined.match(/capterra/i)) badges.capterra = true;
-            if (combined.match(/software.?advice|softwareadvice/i)) badges.software_advice = true;
-            if (combined.match(/getapp/i)) badges.getapp = true;
+            if (combined.match(/\bg2\b|g2\.com|g2crowd/i)) badges.g2 = 1;
+            if (combined.match(/capterra/i)) badges.capterra = 1;
+            if (combined.match(/software.?advice|softwareadvice/i)) badges.software_advice = 1;
+            if (combined.match(/getapp/i)) badges.getapp = 1;
           });
 
           // Strategy 2: Links to review platforms
@@ -890,10 +1020,10 @@ class LandingPageDataCollector {
             const text = $(link).text().toLowerCase();
             const combined = (href + ' ' + text).toLowerCase();
 
-            if (combined.match(/\bg2\b|g2\.com|g2crowd/i)) badges.g2 = true;
-            if (combined.match(/capterra/i)) badges.capterra = true;
-            if (combined.match(/software.?advice|softwareadvice/i)) badges.software_advice = true;
-            if (combined.match(/getapp/i)) badges.getapp = true;
+            if (combined.match(/\bg2\b|g2\.com|g2crowd/i)) badges.g2 = 1;
+            if (combined.match(/capterra/i)) badges.capterra = 1;
+            if (combined.match(/software.?advice|softwareadvice/i)) badges.software_advice = 1;
+            if (combined.match(/getapp/i)) badges.getapp = 1;
           });
 
           // Strategy 3: Text mentions with badge/award context
@@ -901,10 +1031,10 @@ class LandingPageDataCollector {
           badgeContainers.each((_i, el) => {
             const text = $(el).text().toLowerCase();
 
-            if (text.match(/\bg2\b|g2\.com|g2crowd/i)) badges.g2 = true;
-            if (text.match(/capterra/i)) badges.capterra = true;
-            if (text.match(/software.?advice|softwareadvice/i)) badges.software_advice = true;
-            if (text.match(/getapp/i)) badges.getapp = true;
+            if (text.match(/\bg2\b|g2\.com|g2crowd/i)) badges.g2 = 1;
+            if (text.match(/capterra/i)) badges.capterra = 1;
+            if (text.match(/software.?advice|softwareadvice/i)) badges.software_advice = 1;
+            if (text.match(/getapp/i)) badges.getapp = 1;
           });
 
           // Return count of platforms present
@@ -1077,19 +1207,19 @@ class LandingPageDataCollector {
 
       // Calculate ratios
       features.cta_to_content_ratio = features.main_content_word_count > 0
-        ? (features.total_cta_count / features.main_content_word_count * 1000).toFixed(2)
+        ? Number((features.total_cta_count / features.main_content_word_count * 1000).toFixed(2))
         : 0;
 
       features.image_to_text_ratio = features.main_content_word_count > 0
-        ? (features.total_image_count / features.main_content_word_count * 1000).toFixed(2)
+        ? Number((features.total_image_count / features.main_content_word_count * 1000).toFixed(2))
         : 0;
 
       features.testimonial_to_section_ratio = features.section_count > 0
-        ? (features.testimonial_count / features.section_count).toFixed(2)
+        ? Number((features.testimonial_count / features.section_count).toFixed(2))
         : 0;
 
       features.benefit_to_feature_ratio = features.feature_word_count > 0
-        ? (features.benefit_word_count / features.feature_word_count).toFixed(2)
+        ? Number((features.benefit_word_count / features.feature_word_count).toFixed(2))
         : 0;
 
       await page.close();
@@ -1154,7 +1284,12 @@ class LandingPageDataCollector {
           this.progressBar.increment();
         }
 
-        this.logger.info(`✅ Extracted features: ${url}`);
+        // Log success and warn if bot detection suspected
+        if (features.bot_detection_suspected === 1) {
+          this.logger.warn(`⚠️  Bot detection suspected: ${url} (0 buttons/inputs, minimal content)`);
+        } else {
+          this.logger.info(`✅ Extracted features: ${url}`);
+        }
 
         // Save checkpoint every 50 URLs
         if (this.results.length % 50 === 0) {
@@ -1236,7 +1371,7 @@ class LandingPageDataCollector {
     await this.saveCheckpoint();
     await this.saveResults();
 
-    this.logger.info(`\n✅ DATA COLLECTION COMPLETE!`);
+    this.logger.info(`\n✅ DATA COLLECTION COMPLETE!!!`);
     this.logger.info(`════════════════════════════════════════`);
     this.logger.info(`📊 Pages processed: ${this.results.filter(r => !r.error).length}`);
     this.logger.info(`📁 Results saved to: ${CONFIG.OUTPUT_FILE}`);

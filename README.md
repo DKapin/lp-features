@@ -31,8 +31,15 @@ This tool extracts objective, measurable features from landing pages that can be
 - **Progress Tracking**: Real-time progress bar with ETA
 - **Error Logging**: Detailed logs for debugging
 - **Screenshots**: Optional visual captures for reference
+- **Bot Detection Flagging**: Automatic detection of pages blocked by anti-bot protection
 
-## 📊 Feature Categories (111 Total)
+## 📊 Feature Categories (112 Total)
+
+### 0. Data Quality (1 feature)
+- **Bot Detection Flag**: Indicates pages where anti-bot protection prevented proper content loading
+  - Detects blank pages (0 buttons/inputs, <50 words)
+  - Detects partially blocked pages (0 buttons/inputs, 50-2000 words)
+  - Helps filter unreliable data in modeling
 
 ### 1. Hero Section & Layout (15 features)
 - Hero section detection
@@ -263,12 +270,32 @@ node --max-old-space-size=4096 data-collector.js large_file.csv
 ```
 
 **4. Bot detection blocking**
-```javascript
-// Already using puppeteer-extra-plugin-stealth
-// If still blocked, reduce BATCH_SIZE and increase RATE_LIMIT
-BATCH_SIZE: 5,
-RATE_LIMIT: 2000,  // 2 seconds
-```
+
+**Detection**: Pages flagged with `bot_detection_suspected: 1` in the output CSV.
+
+**What's happening**: Enterprise sites (especially those using Cloudflare, PerimeterX, or similar) may block Puppeteer from loading content, resulting in:
+- 0 buttons/inputs detected
+- Blank or minimal page content
+- Missing CTAs, forms, and interactive elements
+
+**Who's affected**: ~5-10% of enterprise SaaS sites (e.g., BambooHR, major enterprise platforms)
+
+**Solutions**:
+1. **Filter in modeling** (recommended):
+   ```python
+   # Exclude bot-blocked pages from training data
+   df_clean = df[df['bot_detection_suspected'] == 0]
+   ```
+
+2. **Manual extraction** for critical pages:
+   - Visit page manually and extract features
+   - Use browser dev tools to analyze HTML
+
+3. **Commercial services** (expensive, not guaranteed):
+   - BrowserBase, Browserless, or Apify with residential proxies
+   - Cost: $50-200/month
+
+**Note**: The stealth plugin helps but cannot bypass all enterprise bot detection. This is a known limitation of web scraping.
 
 ## 📈 Next Steps: Building Predictive Models
 
