@@ -328,7 +328,8 @@ class LandingPageDataCollector {
       }
 
       // Free trial/demo keywords (+12 points)
-      if (text.match(/free trial|free demo|get started free|try.*free|demo/)) {
+      // Multilingual: EN, DE, FR, ES, IT, NL, PT
+      if (text.match(/free trial|free demo|get started free|try.*free|demo|kostenlos.*test|gratis.*test|essai gratuit|d[eé]mo gratuit|prueba gratuita|demo gratuita|prova gratuita|demo gratuita|gratis.*probe|teste gr[aá]tis|demonstra[cç][aã]o/i)) {
         score += 12;
       }
 
@@ -411,6 +412,147 @@ class LandingPageDataCollector {
       tag: '',
       href: ''
     };
+  }
+
+  /**
+   * Analyzes the destination page of a CTA click
+   * @param {string} ctaHref - The href attribute of the primary CTA
+   * @param {string} baseUrl - The original landing page URL (for resolving relative URLs)
+   * @returns {Object} - Analysis of the destination page
+   */
+  async analyzeCtaDestination(ctaHref, baseUrl) {
+    // Default return values if we can't analyze
+    const defaultResult = {
+      cta_leads_to_separate_page: 0,
+      cta_destination_has_form: 0,
+      cta_destination_form_count: 0,
+      cta_destination_form_field_count: 0,
+      cta_destination_is_external: 0,
+      cta_destination_url: ''
+    };
+
+    // Skip if no href, empty, anchor link, or javascript
+    if (!ctaHref || ctaHref === '' || ctaHref === '#' || ctaHref.startsWith('javascript:') || ctaHref.startsWith('mailto:') || ctaHref.startsWith('tel:')) {
+      return defaultResult;
+    }
+
+    try {
+      // Resolve relative URLs to absolute
+      const destinationUrl = new URL(ctaHref, baseUrl).href;
+      const baseUrlObj = new URL(baseUrl);
+      const destUrlObj = new URL(destinationUrl);
+
+      // Check if it's just an anchor link on the same page
+      // Compare URL without hash - if they're identical, it's just a same-page anchor
+      const baseWithoutHash = baseUrlObj.origin + baseUrlObj.pathname + baseUrlObj.search;
+      const destWithoutHash = destUrlObj.origin + destUrlObj.pathname + destUrlObj.search;
+
+      if (baseWithoutHash === destWithoutHash) {
+        // Same page, just different hash section (e.g., #contact, #pricing)
+        return defaultResult;
+      }
+
+      const baseHostname = baseUrlObj.hostname;
+      const destHostname = destUrlObj.hostname;
+      const isExternal = baseHostname !== destHostname;
+
+      // Open destination page
+      const destinationPage = await this.browser.newPage();
+
+      // Set timeout and wait for navigation
+      await destinationPage.goto(destinationUrl, {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+
+      // Wait a bit for any dynamic forms to load
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Analyze the destination page - find the primary conversion form
+      const destinationAnalysis = await destinationPage.evaluate(() => {
+        const forms = document.querySelectorAll('form');
+        const formCount = forms.length;
+
+        if (formCount === 0) {
+          return { formCount: 0, primaryFormFields: 0, hasForms: false };
+        }
+
+        // Find the best conversion form (similar logic to landing page)
+        let bestFormFields = 0;
+        let bestScore = -1;
+
+        forms.forEach(form => {
+          // Count only user-facing input fields (exclude hidden, checkbox, radio, submit, button)
+          const fields = form.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="url"], input:not([type]), textarea, select');
+          const fieldCount = fields.length;
+
+          // Skip empty forms or huge forms (likely not lead capture)
+          if (fieldCount === 0 || fieldCount > 20) return;
+
+          let score = 0;
+
+          // Has email field (+10)
+          if (form.querySelector('input[type="email"], input[name*="email"], input[placeholder*="email" i]')) {
+            score += 10;
+          }
+
+          // Has name field (+5)
+          if (form.querySelector('input[name*="name"], input[placeholder*="name" i]')) {
+            score += 5;
+          }
+
+          // Has phone field (+3)
+          if (form.querySelector('input[type="tel"], input[name*="phone"]')) {
+            score += 3;
+          }
+
+          // Penalty for large forms
+          if (fieldCount > 8) {
+            score -= (fieldCount - 8) * 2;
+          }
+
+          // Bonus for ideal size (3-5 fields)
+          if (fieldCount >= 3 && fieldCount <= 5) {
+            score += 2;
+          }
+
+          // Penalty for checkout/registration forms
+          const formClass = (form.className || '').toLowerCase();
+          const formAction = (form.action || '').toLowerCase();
+          if (formClass.match(/checkout|billing|payment|shipping/) ||
+              formAction.match(/checkout|billing|payment/)) {
+            score -= 15;
+          }
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestFormFields = fieldCount;
+          }
+        });
+
+        return {
+          formCount,
+          primaryFormFields: bestFormFields,
+          hasForms: true
+        };
+      });
+
+      await destinationPage.close();
+
+      return {
+        cta_leads_to_separate_page: 1,
+        cta_destination_has_form: destinationAnalysis.hasForms ? 1 : 0,
+        cta_destination_form_count: destinationAnalysis.formCount,
+        cta_destination_form_field_count: destinationAnalysis.primaryFormFields,
+        cta_destination_is_external: isExternal ? 1 : 0,
+        cta_destination_url: destinationUrl
+      };
+
+    } catch (error) {
+      // If navigation fails (404, timeout, etc.), return defaults
+      console.warn(`Could not analyze CTA destination: ${error.message}`);
+      return defaultResult;
+    }
   }
 
   async extractObjectiveFeatures(url) {
@@ -501,6 +643,9 @@ class LandingPageDataCollector {
       // Get primary CTA using intelligent detection
       const primaryCTA = this.getPrimaryCTA($, heroSection);
 
+      // Analyze CTA destination page (follow the click)
+      const ctaDestination = await this.analyzeCtaDestination(primaryCTA.href, url);
+
       // Improved CTA detection - comprehensive selector
       const allCTAs = $('button, ' +
                        'a.btn, a.button, a[class*="cta"], a[class*="button"], ' +
@@ -559,23 +704,227 @@ class LandingPageDataCollector {
         // === CTA METRICS (IMPROVED) ===
         total_cta_count: ctaElements.length,
         primary_cta_count: heroSection.find('button, a.btn, a.button, [role="button"]').length,
-        form_count: $('form').length,
-        form_field_count: $('form input[type!="hidden"], form textarea, form select').length,
-        has_email_capture: $('input[type="email"], input[name*="email"], input[placeholder*="email" i]').length > 0 ? 1 : 0,
+
+        // Form count - include CTA destination forms if no forms on landing page
+        form_count: (() => {
+          const landingPageForms = $('form').length;
+          // If landing page has forms, use that count
+          // Otherwise, use CTA destination form count (user will click through anyway)
+          if (landingPageForms > 0) return landingPageForms;
+          return ctaDestination.cta_destination_form_count || 0;
+        })(),
+
+        // Primary form field count - finds the most likely conversion form and counts its fields
+        // If no conversion form on landing page, use CTA destination form field count
+        form_field_count: (() => {
+          const forms = $('form');
+
+          let bestForm = null;
+          let bestScore = -1;
+
+          forms.each((_i, form) => {
+            const $form = $(form);
+            // Count only user-facing input fields (exclude hidden, checkbox, radio, submit, button)
+            const fields = $form.find('input[type="text"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="url"], input:not([type]), textarea, select');
+            const fieldCount = fields.length;
+
+            // Skip forms with 0 fields or too many (likely not a lead form)
+            if (fieldCount === 0 || fieldCount > 20) return;
+
+            let score = 0;
+
+            // Has email field (+10) - strong indicator of conversion form
+            if ($form.find('input[type="email"], input[name*="email"], input[placeholder*="email" i]').length > 0) {
+              score += 10;
+            }
+
+            // Has name field (+5)
+            if ($form.find('input[name*="name"], input[placeholder*="name" i]').length > 0) {
+              score += 5;
+            }
+
+            // Has phone field (+3)
+            if ($form.find('input[type="tel"], input[name*="phone"]').length > 0) {
+              score += 3;
+            }
+
+            // Has submit button with conversion text (+5)
+            const submitText = $form.find('button, input[type="submit"]').text().toLowerCase();
+            if (submitText.match(/get|start|submit|sign|register|download|request|demo|trial|contact/)) {
+              score += 5;
+            }
+
+            // Is in hero section (+3)
+            if (heroSection.find(form).length > 0) {
+              score += 3;
+            }
+
+            // Penalty for search forms (-20)
+            const formClass = ($form.attr('class') || '').toLowerCase();
+            const formAction = ($form.attr('action') || '').toLowerCase();
+            if (formClass.includes('search') || formAction.includes('search')) {
+              score -= 20;
+            }
+
+            // Penalty for login forms (-20)
+            if (formClass.includes('login') || formAction.includes('login') || formClass.includes('signin')) {
+              score -= 20;
+            }
+
+            // Penalty for checkout/registration/account forms (-15)
+            if (formClass.match(/checkout|billing|payment|shipping|address|account|register|registration/) ||
+                formAction.match(/checkout|billing|payment|shipping|account/)) {
+              score -= 15;
+            }
+
+            // Penalty for large forms - likely not a simple lead capture form
+            // Typical lead forms have 2-6 fields; more than 8 is suspicious
+            if (fieldCount > 8) {
+              score -= (fieldCount - 8) * 2; // -2 points per field over 8
+            }
+
+            // Prefer smaller forms when scores are equal (less friction = better)
+            // Add small bonus for forms with ideal field count (3-5 fields)
+            if (fieldCount >= 3 && fieldCount <= 5) {
+              score += 2;
+            }
+
+            if (score > bestScore) {
+              bestScore = score;
+              bestForm = $form;
+            }
+          });
+
+          // If we found a good conversion form on landing page, use its field count
+          if (bestForm) {
+            return bestForm.find('input[type="text"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="url"], input:not([type]), textarea, select').length;
+          }
+
+          // Otherwise, fall back to CTA destination form field count
+          // (the form the user will see after clicking the CTA)
+          return ctaDestination.cta_destination_form_field_count || 0;
+        })(),
+        has_email_capture: (() => {
+          // Strategy 1: Direct email inputs on the page
+          const directEmailInput = $('input[type="email"], input[name*="email"], input[placeholder*="email" i]').length > 0;
+
+          // Strategy 2: Iframes containing form services (email capture likely inside)
+          const formIframes = $('iframe[src*="hubspot"], iframe[src*="marketo"], iframe[src*="pardot"], iframe[src*="mailchimp"], iframe[src*="typeform"], iframe[src*="form"], iframe[src*="signup"], iframe[src*="subscribe"]').length > 0;
+
+          // Strategy 3: Known form widget containers (often load via JS)
+          const formWidgets = $('[class*="hubspot"], [id*="hubspot"], [class*="marketo"], [class*="pardot"], [data-form], [data-formid]').length > 0;
+
+          // Strategy 4: CTA destination has a form (email capture is one click away)
+          const ctaDestinationHasForm = ctaDestination.cta_destination_has_form === 1;
+
+          return (directEmailInput || formIframes || formWidgets || ctaDestinationHasForm) ? 1 : 0;
+        })(),
 
         // === MODAL FORM DETECTION ===
         has_modal_form: await page.evaluate(() => {
-          // Strategy 1: Hidden forms (display:none, visibility:hidden, or not visible)
+          // Helper: Check if form is conversion-relevant (has typical lead capture fields)
+          const isConversionForm = (form) => {
+            const inputs = Array.from(form.querySelectorAll('input, textarea, select'));
+
+            // Must have at least 1 input field (exclude empty forms)
+            if (inputs.length === 0) return false;
+
+            // Check for conversion-relevant field indicators
+            const hasEmailField = inputs.some(input => {
+              const type = String(input.type || '').toLowerCase();
+              const name = String(input.name || '').toLowerCase();
+              const id = String(input.id || '').toLowerCase();
+              const placeholder = String(input.placeholder || '').toLowerCase();
+
+              return type === 'email' ||
+                     name.includes('email') || name.includes('e-mail') ||
+                     id.includes('email') || id.includes('e-mail') ||
+                     placeholder.includes('email') || placeholder.includes('e-mail');
+            });
+
+            const hasNameField = inputs.some(input => {
+              const name = String(input.name || '').toLowerCase();
+              const id = String(input.id || '').toLowerCase();
+              const placeholder = String(input.placeholder || '').toLowerCase();
+
+              return name.includes('name') || name.includes('first') || name.includes('last') ||
+                     id.includes('name') || id.includes('first') || id.includes('last') ||
+                     placeholder.includes('name') || placeholder.includes('first') || placeholder.includes('last');
+            });
+
+            const hasPhoneField = inputs.some(input => {
+              const type = String(input.type || '').toLowerCase();
+              const name = String(input.name || '').toLowerCase();
+              const id = String(input.id || '').toLowerCase();
+              const placeholder = String(input.placeholder || '').toLowerCase();
+
+              return type === 'tel' ||
+                     name.includes('phone') || name.includes('mobile') || name.includes('tel') ||
+                     id.includes('phone') || id.includes('mobile') || id.includes('tel') ||
+                     placeholder.includes('phone') || placeholder.includes('mobile') || placeholder.includes('tel');
+            });
+
+            const hasMessageField = inputs.some(input => {
+              const tagName = input.tagName.toLowerCase();
+              const name = String(input.name || '').toLowerCase();
+              const id = String(input.id || '').toLowerCase();
+
+              return tagName === 'textarea' ||
+                     name.includes('message') || name.includes('comment') || name.includes('inquiry') ||
+                     id.includes('message') || id.includes('comment') || id.includes('inquiry');
+            });
+
+            const hasCompanyField = inputs.some(input => {
+              const name = String(input.name || '').toLowerCase();
+              const id = String(input.id || '').toLowerCase();
+              const placeholder = String(input.placeholder || '').toLowerCase();
+
+              return name.includes('company') || name.includes('organization') ||
+                     id.includes('company') || id.includes('organization') ||
+                     placeholder.includes('company') || placeholder.includes('organization');
+            });
+
+            // Exclude common non-conversion forms
+            const formAction = String(form.action || '').toLowerCase();
+            const formClass = String(form.className || '').toLowerCase();
+            const formId = String(form.id || '').toLowerCase();
+
+            const isSearchForm = formAction.includes('search') ||
+                                 formClass.includes('search') ||
+                                 formId.includes('search');
+
+            const isFilterForm = formClass.includes('filter') ||
+                                 formId.includes('filter');
+
+            const isLoginForm = formAction.includes('login') ||
+                               formClass.includes('login') ||
+                               formId.includes('login') ||
+                               formAction.includes('signin') ||
+                               formClass.includes('signin') ||
+                               formId.includes('signin');
+
+            if (isSearchForm || isFilterForm || isLoginForm) return false;
+
+            // Consider it a conversion form if it has email OR (name + message) OR (name + phone)
+            return hasEmailField ||
+                   (hasNameField && hasMessageField) ||
+                   (hasNameField && hasPhoneField) ||
+                   hasCompanyField;
+          };
+
+          // Strategy 1: Hidden conversion forms (display:none, visibility:hidden, or not visible)
           const allForms = Array.from(document.querySelectorAll('form'));
-          const hasHiddenForm = allForms.some(form => {
+          const hasHiddenConversionForm = allForms.some(form => {
             const style = window.getComputedStyle(form);
-            return form.offsetParent === null ||
-                   style.display === 'none' ||
-                   style.visibility === 'hidden' ||
-                   parseFloat(style.opacity) === 0;
+            const isHidden = form.offsetParent === null ||
+                           style.display === 'none' ||
+                           style.visibility === 'hidden' ||
+                           parseFloat(style.opacity) === 0;
+
+            return isHidden && isConversionForm(form);
           });
 
-          // Strategy 2: Forms inside modal/dialog containers
+          // Strategy 2: Conversion forms inside modal/dialog containers
           const modalSelectors = [
             '[role="dialog"] form',
             '[aria-modal="true"] form',
@@ -587,11 +936,12 @@ class LandingPageDataCollector {
             '[id*="modal"] form',
             '[data-modal] form'
           ];
-          const hasModalContainer = modalSelectors.some(selector =>
-            document.querySelectorAll(selector).length > 0
-          );
+          const hasModalConversionForm = modalSelectors.some(selector => {
+            const forms = document.querySelectorAll(selector);
+            return Array.from(forms).some(form => isConversionForm(form));
+          });
 
-          // Strategy 3: Buttons that trigger modals with form-related text
+          // Strategy 3: Buttons with explicit modal attributes and form-related text
           const modalTriggers = document.querySelectorAll(`
             [data-modal],
             [data-toggle="modal"],
@@ -604,15 +954,63 @@ class LandingPageDataCollector {
           `);
           const hasTriggerWithFormKeyword = Array.from(modalTriggers).some(btn => {
             const text = btn.textContent.toLowerCase();
-            return /sign up|contact|get started|request demo|subscribe|join|register/i.test(text);
+            // Multilingual: EN, DE, FR, ES, IT, NL, PT
+            return /sign up|contact|get started|request demo|subscribe|join|register|try it free|start free|free trial|create account|get access|anmelden|registrieren|kontakt|kostenlos testen|jetzt starten|s'inscrire|inscription|essai gratuit|commencer|contacter|registrarse|prueba gratuita|empezar|contacto|iscriviti|prova gratuita|inizia|contatta|aanmelden|gratis proberen|beginnen|contact|inscrever|teste gr[aá]tis|come[cç]ar|contacto/i.test(text);
           });
 
-          return (hasHiddenForm || hasModalContainer || hasTriggerWithFormKeyword) ? 1 : 0;
+          // Strategy 4: Detect JS-rendered modals via prominent CTAs without explicit modal attributes
+          // Modern SPAs (Next.js, React) often don't use data-modal attributes
+          const hasJSModalCTA = (() => {
+            // Look for prominent buttons/links that don't navigate away (no href or href="#")
+            const allButtons = Array.from(document.querySelectorAll('button, a.btn, a.button, a[class*="cta"], a[class*="button"], [role="button"]'));
+
+            return allButtons.some(btn => {
+              const text = btn.textContent.toLowerCase().trim();
+              const href = btn.getAttribute('href');
+
+              // Exclude elements with very long text (likely section headers, not CTAs)
+              if (text.length > 50) return false;
+
+              // Check if button has modal-indicating text
+              // Multilingual: EN, DE, FR, ES, IT, NL, PT
+              const hasModalText = /sign up|contact us|get started|request demo|subscribe|join|register|try it free|start free|free trial|create account|get access|anmelden|registrieren|kontakt|kostenlos testen|jetzt starten|s'inscrire|inscription|essai gratuit|commencer|contacter|registrarse|prueba gratuita|empezar|contacto|iscriviti|prova gratuita|inizia|contatta|aanmelden|gratis proberen|beginnen|contact|inscrever|teste gr[aá]tis|come[cç]ar|contacto/i.test(text);
+
+              // Check if it's likely a modal trigger (not a navigation link)
+              // Must NOT have an href that navigates to another page
+              const isLikelyModal = !href || href === '#' || href.startsWith('#') || href.startsWith('javascript:');
+
+              // For <button> elements, check if they're inside a form that navigates away
+              const isButtonElement = btn.tagName.toLowerCase() === 'button';
+              let isFormSubmitButton = false;
+              if (isButtonElement) {
+                let parent = btn.parentElement;
+                while (parent && parent.tagName.toLowerCase() !== 'form') {
+                  parent = parent.parentElement;
+                }
+                if (parent && parent.tagName.toLowerCase() === 'form') {
+                  const formAction = parent.action || '';
+                  // If form has an action that navigates to another page, it's not a modal
+                  const isExternalForm = formAction &&
+                                        formAction !== '' &&
+                                        !formAction.startsWith('#') &&
+                                        (formAction.startsWith('http') || formAction.startsWith('/'));
+                  isFormSubmitButton = isExternalForm;
+                }
+              }
+
+              // Exclude buttons that submit forms to other pages
+              if (isFormSubmitButton) return false;
+
+              return hasModalText && (isLikelyModal || isButtonElement);
+            });
+          })();
+
+          return (hasHiddenConversionForm || hasModalConversionForm || hasTriggerWithFormKeyword || hasJSModalCTA) ? 1 : 0;
         }),
 
         modal_form_trigger_count: await page.evaluate(() => {
           // Count buttons/links that likely trigger modal forms
-          const triggers = document.querySelectorAll(`
+          const explicitTriggers = document.querySelectorAll(`
             [data-modal],
             [data-toggle="modal"],
             [data-bs-toggle="modal"],
@@ -624,11 +1022,61 @@ class LandingPageDataCollector {
             a[href*="#demo"]
           `);
 
-          return Array.from(triggers).filter(trigger => {
+          const explicitCount = Array.from(explicitTriggers).filter(trigger => {
             const text = trigger.textContent.toLowerCase();
             // Only count if it has form-related keywords
-            return /sign up|contact|get started|request demo|subscribe|join|register|schedule|book|form/i.test(text);
+            // Multilingual: EN, DE, FR, ES, IT, NL, PT
+            return /sign up|contact|get started|request demo|subscribe|join|register|schedule|book|form|try it free|start free|free trial|create account|get access|anmelden|registrieren|kontakt|kostenlos testen|jetzt starten|termin|buchen|s'inscrire|inscription|essai gratuit|commencer|contacter|r[eé]server|formulaire|registrarse|prueba gratuita|empezar|contacto|reservar|iscriviti|prova gratuita|inizia|contatta|prenota|aanmelden|gratis proberen|beginnen|contact|reserveren|inscrever|teste gr[aá]tis|come[cç]ar|contacto|reservar/i.test(text);
           }).length;
+
+          // Also count JS-rendered modal triggers (buttons without explicit attributes)
+          const allButtons = Array.from(document.querySelectorAll('button, a.btn, a.button, a[class*="cta"], a[class*="button"], [role="button"]'));
+
+          const implicitCount = allButtons.filter(btn => {
+            const text = btn.textContent.toLowerCase().trim();
+            const href = btn.getAttribute('href');
+
+            // Exclude elements with very long text (likely section headers, not CTAs)
+            if (text.length > 50) return false;
+
+            // Has modal-indicating text
+            // Multilingual: EN, DE, FR, ES, IT, NL, PT
+            const hasModalText = /sign up|contact us|get started|request demo|subscribe|join|register|schedule|book|form|try it free|start free|free trial|create account|get access|anmelden|registrieren|kontakt|kostenlos testen|jetzt starten|termin|buchen|s'inscrire|inscription|essai gratuit|commencer|contacter|r[eé]server|formulaire|registrarse|prueba gratuita|empezar|contacto|reservar|iscriviti|prova gratuita|inizia|contatta|prenota|aanmelden|gratis proberen|beginnen|contact|reserveren|inscrever|teste gr[aá]tis|come[cç]ar|contacto|reservar/i.test(text);
+
+            // Likely a modal (no href or href="#" or javascript:, OR is a <button> element)
+            const isLikelyModal = !href || href === '#' || href.startsWith('#') || href.startsWith('javascript:');
+            const isButtonElement = btn.tagName.toLowerCase() === 'button';
+
+            // For <button> elements, check if they're inside a form that navigates away
+            let isFormSubmitButton = false;
+            if (isButtonElement) {
+              let parent = btn.parentElement;
+              while (parent && parent.tagName.toLowerCase() !== 'form') {
+                parent = parent.parentElement;
+              }
+              if (parent && parent.tagName.toLowerCase() === 'form') {
+                const formAction = parent.action || '';
+                // If form has an action that navigates to another page, it's not a modal
+                const isExternalForm = formAction &&
+                                      formAction !== '' &&
+                                      !formAction.startsWith('#') &&
+                                      (formAction.startsWith('http') || formAction.startsWith('/'));
+                isFormSubmitButton = isExternalForm;
+              }
+            }
+
+            // Don't double-count explicit triggers
+            const isExplicitTrigger = btn.hasAttribute('data-modal') ||
+                                     btn.hasAttribute('data-toggle') ||
+                                     btn.hasAttribute('data-bs-toggle');
+
+            // Exclude form submit buttons
+            if (isFormSubmitButton) return false;
+
+            return hasModalText && (isLikelyModal || isButtonElement) && !isExplicitTrigger;
+          }).length;
+
+          return explicitCount + implicitCount;
         }),
 
         // === VISUAL ELEMENTS (IMPROVED) ===
@@ -669,6 +1117,112 @@ class LandingPageDataCollector {
           // Strategy 3: Logo-specific attributes
           const attrBased = $('img[alt*="logo" i], img[class*="logo"], [data-testid*="logo"] img').length;
           return Math.max(semanticBased, headingBased, attrBased);
+        })(),
+
+        // === CUSTOMER LOGO SOCIAL PROOF ===
+        has_customer_logos: (() => {
+          // Strategy 1: Class-based detection for customer/client sections
+          // Multilingual: EN, DE, FR, ES, IT, NL, PT
+          const classBased = $('[class*="customer"], [class*="client"], [class*="trusted"], [class*="kunden"], [class*="cliente"]').find('img').length > 0;
+
+          // Strategy 2: Heading-based detection with multilingual keywords
+          // EN: trusted by, our customers, our clients, used by, who uses, companies
+          // DE: vertrauen uns, unsere kunden, verwendet von, unternehmen die
+          // FR: nous font confiance, nos clients, utilisé par, entreprises
+          // ES: confían en nosotros, nuestros clientes, usado por, empresas
+          // IT: si fidano di noi, nostri clienti, usato da, aziende
+          // NL: vertrouwen ons, onze klanten, gebruikt door, bedrijven
+          // PT: confiam em nós, nossos clientes, usado por, empresas
+          const headingBased = $('h1, h2, h3, h4, h5, h6, [class*="heading"], [class*="title"]').filter((_i, el) => {
+            const text = $(el).text().toLowerCase();
+            return text.match(/trusted by|our customers?|our clients?|used by|who uses|join|vertrauen uns|unsere kunden|verwendet von|unternehmen die|nous font confiance|nos clients?|utilis[eé] par|entreprises|conf[ií]an en|nuestros clientes?|usado por|empresas|si fidano|nostri clienti|usato da|aziende|vertrouwen ons|onze klanten|gebruikt door|bedrijven|confiam em|nossos clientes?|usado por|empresas/i);
+          }).parent().find('img').length > 0;
+
+          // Strategy 3: Section with multiple logo-like images (3+) in customer-related context
+          const sectionBased = (() => {
+            const logoSections = $('[class*="logo"], [class*="customer"], [class*="client"], [class*="brand"], [class*="company"]');
+            return logoSections.filter((_i, section) => {
+              const imgs = $(section).find('img').length;
+              const text = $(section).text().toLowerCase();
+              const hasCustomerKeywords = text.match(/trusted|customer|client|used by|join|vertrauen|kunden|confiance|clients|conf[ií]an|clientes|fidano|clienti|vertrouwen|klanten|confiam/i);
+              return imgs >= 3 && hasCustomerKeywords;
+            }).length > 0;
+          })();
+
+          return (classBased || headingBased || sectionBased) ? 1 : 0;
+        })(),
+
+        customer_logo_count: (() => {
+          // Count logos in customer/client sections only
+          // Strategy 1: Direct class-based
+          const classLogos = $('[class*="customer"], [class*="client"], [class*="trusted"], [class*="kunden"], [class*="cliente"]').find('img').length;
+
+          // Strategy 2: Heading-based sections (multilingual)
+          const headingLogos = $('h1, h2, h3, h4, h5, h6, [class*="heading"], [class*="title"]').filter((_i, el) => {
+            const text = $(el).text().toLowerCase();
+            return text.match(/trusted by|our customers?|our clients?|used by|who uses|vertrauen uns|unsere kunden|verwendet von|nous font confiance|nos clients?|utilis[eé] par|conf[ií]an en|nuestros clientes?|usado por|si fidano|nostri clienti|usato da|vertrouwen ons|onze klanten|gebruikt door|confiam em|nossos clientes?/i);
+          }).parent().find('img').length;
+
+          return Math.max(classLogos, headingLogos);
+        })(),
+
+        // === INTEGRATION BADGES ===
+        has_integration_badges: (() => {
+          // Strategy 1: Class-based detection for integration sections
+          const classBased = $('[class*="integration"], [class*="connect"], [class*="partner"], [class*="compatible"]').find('img').length > 0;
+
+          // Strategy 2: Heading-based detection with multilingual keywords
+          // EN: integrates with, works with, connects to, compatible with, powered by
+          // DE: integriert mit, funktioniert mit, verbindet mit, kompatibel mit
+          // FR: s'intègre avec, fonctionne avec, se connecte à, compatible avec
+          // ES: se integra con, funciona con, se conecta con, compatible con
+          // IT: si integra con, funziona con, si collega a, compatibile con
+          // NL: integreert met, werkt met, verbindt met, compatibel met
+          // PT: integra com, funciona com, conecta com, compatível com
+          const headingBased = $('h1, h2, h3, h4, h5, h6, [class*="heading"], [class*="title"]').filter((_i, el) => {
+            const text = $(el).text().toLowerCase();
+            return text.match(/integrat(es?|ions?)|works? with|connects? to|compatible|powered by|integriert|funktioniert mit|verbindet|kompatibel|s'int[eè]gre|fonctionne avec|se connecte|compatible|se integra|funciona con|se conecta|compatible|si integra|funziona con|si collega|compatibile|integreert|werkt met|verbindt|compatibel|integra com|funciona com|conecta com|compat[ií]vel/i);
+          }).parent().find('img').length > 0;
+
+          // Strategy 3: Detect common integration platform names in alt/src
+          const platformBased = (() => {
+            const integrationPlatforms = /salesforce|slack|dropbox|google drive|onedrive|box|aws|stripe|paypal|square|quickbooks|xero|freshbooks|shopify|woocommerce|magento|mailchimp|hubspot|pipedrive|zoho|microsoft teams|zoom|asana|trello|jira|github|gitlab|bitbucket/i;
+            const images = $('img');
+            return images.filter((_i, img) => {
+              const alt = $(img).attr('alt') || '';
+              const src = $(img).attr('src') || '';
+              const combined = (alt + ' ' + src).toLowerCase();
+              return integrationPlatforms.test(combined);
+            }).length > 0;
+          })();
+
+          return (classBased || headingBased || platformBased) ? 1 : 0;
+        })(),
+
+        integration_badge_count: (() => {
+          // Count logos in integration sections only
+          // Strategy 1: Direct class-based
+          const classLogos = $('[class*="integration"], [class*="connect"], [class*="partner"], [class*="compatible"]').find('img').length;
+
+          // Strategy 2: Heading-based sections (multilingual)
+          const headingLogos = $('h1, h2, h3, h4, h5, h6, [class*="heading"], [class*="title"]').filter((_i, el) => {
+            const text = $(el).text().toLowerCase();
+            return text.match(/integrat(es?|ions?)|works? with|connects? to|compatible|powered by|integriert|funktioniert mit|verbindet|kompatibel|s'int[eè]gre|fonctionne avec|se connecte|compatible|se integra|funciona con|se conecta|compatible|si integra|funziona con|si collega|compatibile|integreert|werkt met|verbindt|compatibel|integra com|funciona com|conecta com|compat[ií]vel/i);
+          }).parent().find('img').length;
+
+          // Strategy 3: Count specific integration platform matches
+          const platformLogos = (() => {
+            const integrationPlatforms = /salesforce|slack|dropbox|google drive|onedrive|box|aws|stripe|paypal|square|quickbooks|xero|freshbooks|shopify|woocommerce|magento|mailchimp|hubspot|pipedrive|zoho|microsoft teams|zoom|asana|trello|jira|github|gitlab|bitbucket/i;
+            const images = $('img');
+            return images.filter((_i, img) => {
+              const alt = $(img).attr('alt') || '';
+              const src = $(img).attr('src') || '';
+              const combined = (alt + ' ' + src).toLowerCase();
+              return integrationPlatforms.test(combined);
+            }).length;
+          })();
+
+          return Math.max(classLogos, headingLogos, platformLogos);
         })(),
 
         has_social_proof: (() => {
@@ -760,7 +1314,51 @@ class LandingPageDataCollector {
         // === LAYOUT INDICATORS ===
         has_navigation: $('nav, [role="navigation"]').length > 0 ? 1 : 0,
         has_footer: $('footer').length > 0 ? 1 : 0,
-        column_layout_count: $('.col, [class*="column"], [class*="grid"]').length,
+        column_layout_count: (() => {
+          // Strategy: Count major page sections that visually display as multi-column layouts
+          // Focus on semantic sections with side-by-side content, not CSS framework internals
+
+          let count = 0;
+
+          // Look for main semantic containers that might have multi-column layouts
+          const potentialSections = $('section, main > div, [class*="section"], [class*="container"] > div, article');
+
+          potentialSections.each((_i, section) => {
+            const $section = $(section);
+
+            // Skip if section is too small (likely not a major layout section)
+            const text = $section.text().trim();
+            if (text.length < 50) return;
+
+            // Get direct children that could be columns
+            const children = $section.children('div, article, aside, [class*="col"]');
+
+            // Need at least 2 children to be multi-column
+            if (children.length < 2) return;
+
+            // Check if children look like columns (have column classes or are structured similarly)
+            const columnChildren = children.filter((_i, child) => {
+              const $child = $(child);
+              const classes = $child.attr('class') || '';
+
+              // Has explicit column classes
+              if (classes.match(/\bcol\b|column|grid-item/)) return true;
+
+              // OR all children have similar structure (cards, features, etc.)
+              if (classes.match(/card|feature|item|box|panel|service|benefit/)) return true;
+
+              return false;
+            });
+
+            // If 2+ children have column-like characteristics, count this section
+            if (columnChildren.length >= 2) {
+              count++;
+            }
+          });
+
+          // Cap at reasonable maximum (typical landing pages have 3-8 multi-column sections)
+          return Math.min(count, 12);
+        })(),
 
         // === ENGAGEMENT ELEMENTS ===
         has_chat_widget: (() => {
@@ -925,18 +1523,27 @@ class LandingPageDataCollector {
         primary_cta_in_hero: primaryCTA.score >= 30 ? 1 : 0,
         primary_cta_is_button_element: primaryCTA.tag === 'button' ? 1 : 0,
 
-        cta_uses_action_verb: primaryCTA.text.toLowerCase().match(/^(get|start|try|download|claim|join|discover|learn|see|find|build|create|grow|sign|subscribe|buy|purchase)/) ? 1 : 0,
+        cta_uses_action_verb: primaryCTA.text.toLowerCase().match(/^(get|start|try|download|claim|join|discover|learn|see|find|build|create|grow|sign|subscribe|buy|purchase|book|request|contact|schedule|reserve|talk|demo|watch|view|explore|test|register|apply|activate|unlock|access|open|order|shop|upgrade|install|compare|choose|select|read|check|calculate|estimate|browse|anmelden|registrieren|kontakt|termin|buchen|lernen|entdecken|zugriff|freischalten|aktivieren|[oö]ffnen|bestellen|kaufen|aktualisieren|upgraden|installieren|vergleichen|w[aä]hlen|ausw[aä]hlen|lesen|berechnen|s'inscrire|commencer|d[eé]couvrir|r[eé]server|contacter|demander|acc[eé]der|d[eé]verrouiller|activer|ouvrir|commander|acheter|mettre|installer|comparer|choisir|s[eé]lectionner|lire|calculer|registrarse|empezar|descubrir|reservar|solicitar|contactar|acceder|desbloquear|activar|abrir|pedir|ordenar|comprar|actualizar|instalar|comparar|elegir|seleccionar|leer|calcular|iscriviti|inizia|scopri|prenota|richiedi|contattare|accedi|sblocca|attiva|apri|ordina|acquista|aggiorna|installa|confronta|scegli|seleziona|leggi|calcola|aanmelden|beginnen|ontdekken|reserveren|aanvragen|contacteren|toegang|ontgrendel|activeer|open|bestel|koop|upgrade|installeer|vergelijk|kies|selecteer|lees|bereken|inscrever|come[cç]ar|descobrir|reservar|solicitar|contactar|acessar|desbloquear|ativar|abrir|pedir|encomendar|comprar|atualizar|instalar|comparar|escolher|selecionar|ler|calcular)/) ? 1 : 0,
 
         cta_uses_first_person: primaryCTA.text.match(/\b(my|I'm|I'll|me)\b/i) ? 1 : 0,
 
+        // === CTA CLICK-THROUGH ANALYSIS ===
+        // Follows the primary CTA to analyze the destination page
+        cta_leads_to_separate_page: ctaDestination.cta_leads_to_separate_page,
+        cta_destination_has_form: ctaDestination.cta_destination_has_form,
+        cta_destination_form_count: ctaDestination.cta_destination_form_count,
+        cta_destination_form_field_count: ctaDestination.cta_destination_form_field_count,
+        cta_destination_is_external: ctaDestination.cta_destination_is_external,
+        cta_destination_url: ctaDestination.cta_destination_url,
+
         // === CRO TIER 1: URGENCY & SCARCITY (Enhanced) ===
-        specific_deadline_present: bodyText.match(/\d+\s*(hours?|days?|minutes?)\s*(left|remaining)/i) ? 1 : 0,
+        specific_deadline_present: bodyText.match(/\d+\s*(hours?|days?|minutes?|stunden?|tage?|minuten?|heures?|jours?|horas?|d[ií]as?|ore|giorni|uur|uren|dagen|horas?|dias?)\s*(left|remaining|[uü]brig|verbleibend|restantes?|quedan|rimane|over|restam)/i) ? 1 : 0,
 
-        stock_scarcity_present: bodyText.match(/only\s+\d+\s+(left|remaining|in stock)/i) ? 1 : 0,
+        stock_scarcity_present: bodyText.match(/(only|nur|seulement|solo|alleen|apenas)\s+\d+\s+(left|remaining|in stock|[uü]brig|auf lager|restants?|en stock|quedan|rimane|in magazzino|over|op voorraad|restam|em estoque)/i) ? 1 : 0,
 
-        limited_spots_present: bodyText.match(/\d+\s*(spots?|seats?)\s*(left|remaining|available)/i) ? 1 : 0,
+        limited_spots_present: bodyText.match(/\d+\s*(spots?|seats?|pl[aä]tze?|places?|plazas?|posti|plaatsen|lugares|vagas)\s*(left|remaining|available|[uü]brig|verf[uü]gbar|disponibles?|rimane|disponibili|beschikbaar|restam|dispon[ií]veis)/i) ? 1 : 0,
 
-        expiring_offer_present: bodyText.match(/expires?|ending|last chance|don't miss/i) ? 1 : 0,
+        expiring_offer_present: bodyText.match(/expires?|ending|last chance|don'?t miss|l[aä]uft ab|endet|letzte chance|nicht verpassen|expire|se termine|derni[eè]re chance|ne manquez pas|expira|termina|[uú]ltima (oportunidad|chance)|no (te pierdas|perca)|scade|ultima possibilit[aà]|non perdere|verloopt|eindigt|laatste kans|mis het niet/i) ? 1 : 0,
 
         // === CRO TIER 1: SOCIAL PROOF SPECIFICITY ===
         testimonial_has_photo: (() => {
@@ -956,9 +1563,9 @@ class LandingPageDataCollector {
             .text().match(/[-–—]\s*[A-Z][a-z]+\s+[A-Z]|by\s+[A-Z][a-z]+\s+[A-Z]/)
         ) ? 1 : 0,
 
-        customer_count_mentioned: !!(bodyText.match(/\d+[,\d]*\s*(customers?|users?|clients?|companies|businesses)/i)) ? 1 : 0,
+        customer_count_mentioned: !!(bodyText.match(/\d+[,.\d]*\s*(customers?|users?|clients?|companies|businesses|kunden?|nutzer|unternehmen|clients?|utilisateurs?|entreprises?|clientes?|usuarios?|empresas?|clienti|utenti|aziende?|klanten|gebruikers?|bedrijven|clientes?|usu[aá]rios?|empresas?)/i)) ? 1 : 0,
 
-        customer_count_value: (bodyText.match(/(\d+)[,\d]*\s*(?:k|thousand|million|customers?|users?|clients?|companies)/i) || [])[1] || null,
+        customer_count_value: (bodyText.match(/(\d+)[,.\d]*\s*(?:k|thousand|million|tausend|millionen?|mille|millions?|mil|millones?|mila|milioni?|duizend|miljoen|mil|milh[oõ]es?|customers?|users?|clients?|companies|kunden?|nutzer|clients?|utilisateurs?|clientes?|usuarios?|clienti|utenti|klanten|gebruikers?|clientes?|usu[aá]rios?)/i) || [])[1] || null,
 
         case_study_present: (() => {
           // Strategy 1: Class-based detection
@@ -972,9 +1579,9 @@ class LandingPageDataCollector {
         })(),
 
         // === CRO TIER 2: TRUST & SECURITY ===
-        money_back_guarantee: !!(bodyText.match(/money.back|refund|guarantee|risk.free/i)) ? 1 : 0,
+        money_back_guarantee: !!(bodyText.match(/money.back|refund|guarantee|risk.free|geld.zur[uü]ck|r[uü]ckerstattung|garantie|risikofrei|argent.retour|remboursement|garantie|sans.risque|devoluci[oó]n|reembolso|garant[ií]a|sin.riesgo|rimborso|garanzia|senza.rischio|geld.terug|terugbetaling|garantie|risicovrij|devolu[cç][aã]o|reembolso|garantia|sem.risco/i)) ? 1 : 0,
 
-        free_trial_mentioned: !!(bodyText.match(/free trial|try free|no credit card|start free/i)) ? 1 : 0,
+        free_trial_mentioned: !!(bodyText.match(/free trial|try free|no credit card|start free|kostenlos|gratis.*test|keine kreditkarte|essai gratuit|sans carte|prueba gratuita|sin tarjeta|prova gratuita|senza carta|gratis.*proef|geen creditcard|teste gr[aá]tis|sem cart[aã]o/i)) ? 1 : 0,
 
         ssl_visible: (() => {
           // Strategy 1: Badge images
@@ -1161,18 +1768,36 @@ class LandingPageDataCollector {
 
         // === CRO TIER 3: EXIT INTENT & RETENTION ===
         exit_popup_present: await page.evaluate(() => {
-          // Strategy 1: Exit-related class names
-          const classBased = document.querySelectorAll('[class*="exit"], [id*="exit"], [class*="exit-intent"]').length > 0;
-          // Strategy 2: Hidden modals (exit popups are typically hidden by default)
-          const hiddenModals = Array.from(document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"]'))
+          // Strategy 1: Exit-intent specific class names or IDs
+          const classBased = document.querySelectorAll('[class*="exit-intent"], [class*="exitintent"], [class*="exit-popup"], [class*="leave-popup"], [id*="exit-intent"], [id*="exitintent"], [data-exit]').length > 0;
+
+          // Strategy 2: Hidden modals with exit/leave/wait keywords in their content or attributes
+          const exitModals = Array.from(document.querySelectorAll('[class*="modal"], [class*="popup"], [class*="overlay"]'))
             .filter(el => {
               const style = window.getComputedStyle(el);
-              return style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0';
+              const isHidden = style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0';
+              if (!isHidden) return false;
+
+              // Check if modal contains exit-intent keywords
+              const text = el.textContent.toLowerCase();
+              const classes = (el.className || '').toLowerCase();
+              const hasExitKeywords = text.match(/wait|don't go|before you leave|leaving so soon|one more thing|last chance|don't miss/i) ||
+                                     classes.match(/exit|leave|abandon/);
+              return hasExitKeywords;
             }).length > 0;
-          // Strategy 3: Script tags mentioning exit intent
+
+          // Strategy 3: Script tags with exit intent library patterns
           const scriptBased = Array.from(document.querySelectorAll('script'))
-            .some(script => script.textContent.match(/exit|exitintent|mouseout/i));
-          return (classBased || hiddenModals || scriptBased) ? 1 : 0;
+            .some(script => {
+              const content = script.textContent || '';
+              // Look for specific exit-intent patterns, not just "exit" or "mouseout" generically
+              return content.match(/exitintent|exit-intent|ouibounce|exit\.js|mouseleave.*modal|mouseout.*popup/i);
+            });
+
+          // Strategy 4: Known exit-intent tools/libraries
+          const toolsBased = document.querySelectorAll('[class*="ouibounce"], [class*="optinmonster"], [class*="sumo"], [class*="privy"], [data-optinmonster], [data-sumo]').length > 0;
+
+          return (classBased || exitModals || scriptBased || toolsBased) ? 1 : 0;
         }),
 
         sticky_header: await page.evaluate(() => {
